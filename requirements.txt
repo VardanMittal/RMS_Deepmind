@@ -1,0 +1,7 @@
+biokinesis_sdk
+torch
+matplotlib
+numpy
+scipy
+pandas
+huggingface_hub

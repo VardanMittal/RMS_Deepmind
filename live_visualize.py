@@ -1,182 +1,141 @@
 import asyncio
-import time
+import struct
+import sys
 import threading
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
+from bleak import BleakClient, BleakScanner
+from math import atan2, asin, degrees
 
-from biokinesis_sdk.receiver.ble_receiver import SensorRTReceiver
-from biokinesis_sdk.export import ExportManager
-from biokinesis_sdk.emg.features import rms_envelope
-from biokinesis_sdk.imu.kinematics import quaternions_to_euler_batch
+# Constants
+PACKET_FORMAT = "<HII9f10HBI"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 
-is_running = True
-
-def start_ble_receiver(receiver):
-    """Runs the asyncio event loop for BLE receiving in a separate thread."""
-    async def run_receiver():
-        receive_task = asyncio.create_task(receiver.connect_and_run())
+class RealTimePlotter:
+    def __init__(self):
+        self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         
-        while is_running:
-            await asyncio.sleep(0.1)
-            if receive_task.done():
-                break
+        # --- FIX: Set Background Color to Black ---
+        pg.setConfigOption('background', 'k') 
+        pg.setConfigOption('foreground', 'w')
+
+        self.win = pg.GraphicsLayoutWidget(show=True, title="SensorRT ENU Fusion")
+        self.win.resize(1200, 900)
         
-        # Cancel the task and wait for it to clean up gracefully
-        receive_task.cancel()
-        try:
-            await receive_task
-        except asyncio.CancelledError:
-            pass
-
-    asyncio.run(run_receiver())
-
-def main():
-    global is_running
-    
-    print("=" * 60)
-    print(" Biokinesis-SDK Live Visualizer")
-    print(" Close the plot window to stop recording and export data.")
-    print("=" * 60)
-    
-    receiver = SensorRTReceiver()
-
-    ble_thread = threading.Thread(target=start_ble_receiver, args=(receiver,), daemon=True)
-    ble_thread.start()
-    
-    print("\nWaiting for BLE connection... Make sure the sensor is ON.")
-    
-    fig, (ax_emg, ax_imu) = plt.subplots(2, 1, figsize=(10, 8))
-    fig.canvas.manager.set_window_title('Live Sensor Data')
-
-    line_emg, = ax_emg.plot([], [], lw=1.5, color='#1f77b4', label='EMG (Filtered)')
-    line_rms, = ax_emg.plot([], [], lw=2, color='#ff7f0e', label='EMG (RMS)')
-    ax_emg.set_title('Live Muscle Activity (EMG)')
-    ax_emg.set_ylabel('Amplitude (µV)')
-    ax_emg.legend(loc='upper right')
-    
-    # Setup IMU Plot (Euler Angles)
-    lines_imu = []
-    colors = ['#d62728', '#2ca02c', '#9467bd']
-    labels = ['Roll (X)', 'Pitch (Y)', 'Yaw (Z)']
-    for i in range(3):
-        line, = ax_imu.plot([], [], lw=1.5, color=colors[i], label=labels[i])
-        lines_imu.append(line)
+        # Plot Setup
+        self.p_emg = self.win.addPlot(title="EMG Signal")
+        self.win.nextRow()
+        self.p_angles = self.win.addPlot(title="ENU Orientation (Euler Angles)")
+        self.p_angles.addLegend()
+        self.p_angles.setLabel('left', 'Degrees')
+        self.win.nextRow()
+        self.p_accel = self.win.addPlot(title="Accelerometer (g)")
         
-    ax_imu.set_title('Live Motion (Euler Angles)')
-    ax_imu.set_ylabel('Angle (degrees)')
-    ax_imu.set_xlabel('Recent Samples')
-    ax_imu.legend(loc='upper right')
-    
-    def init():
-        ax_emg.set_xlim(0, 1000)
-        ax_emg.set_ylim(-500, 500)
-        ax_imu.set_xlim(0, 100)
-        ax_imu.set_ylim(-180, 180)
-        return [line_emg, line_rms] + lines_imu
+        # Curves
+        self.curve_emg = self.p_emg.plot(pen='y')
+        self.curve_roll = self.p_angles.plot(pen='r', name='Roll (X)')
+        self.curve_pitch = self.p_angles.plot(pen='g', name='Pitch (Y)')
+        self.curve_yaw = self.p_angles.plot(pen='b', name='Yaw (Z)')
+        self.curve_ax = self.p_accel.plot(pen='r')
 
-    def update(frame):
-        """Update function called repeatedly by FuncAnimation."""
-        if not is_running:
-            return [line_emg, line_rms] + lines_imu
+        # Data Buffers
+        self.max_samples = 200
+        self.data_emg = np.zeros(2000)
+        self.data_roll = np.zeros(self.max_samples)
+        self.data_pitch = np.zeros(self.max_samples)
+        self.data_yaw = np.zeros(self.max_samples)
+        self.data_ax = np.zeros(self.max_samples)
+
+        self.buffer = bytearray()
+        self.is_running = True
+
+        # Timer for UI
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_plots)
+        self.timer.start(30)
+
+    def compute_angles(self, ax, ay, az, mx, my, mz):
+        """
+        Calculates Roll and Pitch from Accel. 
+        Calculates Tilt-Compensated Yaw (Heading) from Mag.
+        Maps to ENU frame.
+        """
+        # Roll (around X) and Pitch (around Y)
+        roll = atan2(ay, az)
+        pitch = atan2(-ax, np.sqrt(ay*ay + az*az))
+        
+        # Tilt Compensation for Magnetometer (Yaw)
+        mag_x = mx * np.cos(pitch) + mz * np.sin(pitch)
+        mag_y = mx * np.sin(roll) * np.sin(pitch) + my * np.cos(roll) - mz * np.sin(roll) * np.cos(pitch)
+        yaw = atan2(-mag_y, mag_x)
+
+        return degrees(roll), degrees(pitch), degrees(yaw)
+
+    def update_plots(self):
+        self.curve_emg.setData(self.data_emg)
+        self.curve_roll.setData(self.data_roll)
+        self.curve_pitch.setData(self.data_pitch)
+        self.curve_yaw.setData(self.data_yaw)
+        self.curve_ax.setData(self.data_ax)
+
+    def handle_ble_data(self, sender, data):
+        self.buffer.extend(data)
+        
+        while len(self.buffer) >= PACKET_SIZE:
+            if struct.unpack("<H", self.buffer[:2])[0] != 0xbeef:
+                self.buffer.pop(0)
+                continue
             
-        # Safely collect data from the orchestrator
-        data = receiver.orch.collect_all_data()
-        
-        if "1" in data and "emg_filtered" in data["1"]:
-            emg_data = data["1"]["emg_filtered"]
-            imu_quats = data["1"].get("imu_quaternions", [])
+            packet = self.buffer[:PACKET_SIZE]
+            # Efficiently clear processed bytes
+            del self.buffer[:PACKET_SIZE]
             
-            # --- Update EMG ---
-            window_size_emg = 1000  # Show last N samples
-            if len(emg_data) > 0:
-                y = emg_data[-window_size_emg:]
-                x = np.arange(len(y))
-                
-                line_emg.set_data(x, y)
-                
-                # Dynamically scale the Y axis for EMG
-                max_val = max(abs(np.max(y)), abs(np.min(y))) + 50
-                ax_emg.set_ylim(-max_val, max_val)
-                ax_emg.set_xlim(0, len(y))
-                
-                # Calculate sliding RMS on the visible window
-                if len(y) >= 50:
-                    # Using a 50-sample window for the RMS envelope visual
-                    rms_val = rms_envelope(y, window_samples=50)
-                    step = 25
-                    x_rms = np.arange(len(rms_val)) * step + (50 // 2)
-                    line_rms.set_data(x_rms, rms_val)
-                else:
-                    line_rms.set_data([], [])
+            unpacked = struct.unpack(PACKET_FORMAT, packet)
             
-            # --- Update IMU ---
-            window_size_imu = 100  # Show last N samples
-            if len(imu_quats) > 0:
-                q_array = np.array(imu_quats[-window_size_imu:])
-                if q_array.ndim == 2 and q_array.shape[1] == 4:
-                    euler_rads = quaternions_to_euler_batch(q_array)
-                    y_imu_all = np.degrees(euler_rads)
-                    x_imu = np.arange(len(y_imu_all))
-                    
-                    ax_imu.set_xlim(0, len(x_imu))
-                    
-                    for i in range(3): 
-                        if y_imu_all.shape[1] > i:
-                            lines_imu[i].set_data(x_imu, y_imu_all[:, i])
-                    
-        return [line_emg, line_rms] + lines_imu
-    
-    def on_close(event):
-        """Triggered when the user closes the plot window."""
-        global is_running
-        print("\nPlot window closed. Stopping receiver...")
-        is_running = False
+            # IMU Data Extract
+            ax, ay, az = unpacked[3:6]
+            gx, gy, gz = unpacked[6:9]
+            mx, my, mz = unpacked[9:12]
+            
+            # Compute ENU Angles
+            r, p, y = self.compute_angles(ax, ay, az, mx, my, mz)
 
-    # Register the close event
-    fig.canvas.mpl_connect('close_event', on_close)
-    
-    # Start the matplotlib animation loop
-    ani = FuncAnimation(fig, update, frames=None, init_func=init, blit=True, interval=50, cache_frame_data=False)
-    
-    plt.tight_layout()
-    # This call blocks the main thread until the window is closed
-    plt.show()
+            # Shift Buffers
+            self.data_roll = np.roll(self.data_roll, -1); self.data_roll[-1] = r
+            self.data_pitch = np.roll(self.data_pitch, -1); self.data_pitch[-1] = p
+            self.data_yaw = np.roll(self.data_yaw, -1); self.data_yaw[-1] = y
+            self.data_ax = np.roll(self.data_ax, -1); self.data_ax[-1] = ax
+            
+            # Update EMG
+            emg_samples = unpacked[12:22]
+            self.data_emg = np.roll(self.data_emg, -10)
+            self.data_emg[-10:] = emg_samples
 
-    # --- Clean up and Export ---
-    # Wait maximum 2 seconds for the BLE thread to clean up
-    if ble_thread.is_alive():
-        ble_thread.join(timeout=2.0)
-    
-    print("\n=== Exporting Recorded Session ===")
-    final_data = receiver.orch.collect_all_data()
-    
-    if "1" not in final_data or "emg_filtered" not in final_data["1"] or len(final_data["1"]["emg_filtered"]) == 0:
-         print("No data was collected during the session. Exiting.")
-         return
-
-    output_dir = "./Data/"
-    formats = ["csv"]
-    
-    print(f"Exporting files to '{output_dir}/' in formats: {formats}")
-    result = ExportManager.export_all(
-        final_data, 
-        output_dir, 
-        prefix="live_session",
-        formats=formats,
-        model_file="gait2392_simbody.osim",
-        imu_to_body_map={"Xiao_Arm": "radius_r"},  
-        mvc_values={"Xiao_Arm": 1000.0},         
-        emg_to_muscle_map={"Xiao_Arm": ["biceps_brachii"]}
+async def run_ble(plotter):
+    print("Searching for Sensor...")
+    device = await BleakScanner.find_device_by_filter(
+        lambda d, ad: "XIAO" in (d.name or "") or "Sensor" in (d.name or "")
     )
     
-    print("\nExport successful!")
-    print(f"CSV Check: {result.get('csv', [])}")
-    print("Done. Goodbye!")
+    if not device:
+        print("Device not found.")
+        return
+
+    async with BleakClient(device) as client:
+        print(f"Connected to {device.name}")
+        await client.start_notify(UART_TX_CHAR_UUID, plotter.handle_ble_data)
+        while plotter.is_running:
+            await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
+    plotter = RealTimePlotter()
+    ble_thread = threading.Thread(target=lambda: asyncio.run(run_ble(plotter)), daemon=True)
+    ble_thread.start()
+    
     try:
-        main()
-    except KeyboardInterrupt:
-        print("\nScript interrupted by user. Stopping...")
-        is_running = False
+        sys.exit(plotter.app.exec())
+    finally:
+        plotter.is_running = False

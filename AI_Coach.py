@@ -15,8 +15,8 @@ import requests
 
 # ── Configuration ────────────────────────────────────────────────────────────
 LLAMA_CPP_URL   = "http://localhost:8080/v1/chat/completions"
-COACHING_MODEL  = "gemma-4"          # swap model name here when ready
-COOLDOWN_SEC    = 6                  # min seconds between live alerts
+COACHING_MODEL  = "ggml-org/gemma-4-E2B-it-GGUF"          
+COOLDOWN_SEC    = 6                  
 MIN_EMG_SAMPLES = 256
 
 # ── Function Calling Tool Definitions ────────────────────────────────────────

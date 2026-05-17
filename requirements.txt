@@ -1,4 +1,3 @@
-biokinesis_sdk
 torch
 matplotlib
 numpy
